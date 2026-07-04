@@ -20,6 +20,7 @@ echo "your prompt" | run-model [flags]        # prompt via stdin also works
 | `--effort <e>` | `low`\|`medium`\|`high`\|`xhigh`\|`max` (not supported on haiku) | API default (`high`) |
 | `--thinking` | Enable adaptive thinking; summaries print to **stderr** (not on haiku) | off |
 | `--json` | Print `{text, model, stop_reason, usage, tool_calls}` JSON | plain text |
+| `--events` | JSONL to stdout as each block completes (see below) | off |
 | `--max-tokens <n>` | Per-response output cap | 16000 |
 | `--max-turns <n>` | Agentic loop cap | 24 |
 | `--provider <p>` | Only `anthropic` for now | `anthropic` |
@@ -55,16 +56,19 @@ export default async function myTool(input: { arg: string }): Promise<string> {
 
 ## Output & exit codes
 
-- Final model text → **stdout**. Tool-call traces and thinking → **stderr**.
+- Final model text → **stdout**. Live trace (`[text]`, `[tool]`, `[tool result]`,
+  `[thinking]`) → **stderr**, each line printed as that block completes.
 - Exit `0` success · `1` usage/API error · `2` model refused · `3` hit `--max-turns`.
-- For scripting, use `--json` and parse stdout.
+- For scripting, use `--json` (one final JSON object) or `--events` (live JSONL,
+  one line per completed block: `{"event": "thinking"|"text"|"tool_use"|"tool_result", ...}`,
+  ending with `{"event": "done", text, model, stop_reason, usage}`). With
+  `--events`, stdout is pure JSONL — nothing else is printed there.
 
 ## Auth
 
 Needs `ANTHROPIC_API_KEY` in the environment (or an `ant auth login` profile —
-the SDK resolves either). **There is currently no key configured on this
-machine**; the command will fail with "Could not resolve authentication
-method" until one is set.
+the SDK resolves either). A key lives at `~/.keys/.anthropic`; callers like
+grim_ide's `implement.sh` export it from there.
 
 ## Example
 

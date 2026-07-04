@@ -23,6 +23,7 @@ interface Args {
   effort?: string;
   thinking: boolean;
   json: boolean;
+  events: boolean;
   maxTokens: number;
   maxTurns: number;
 }
@@ -37,6 +38,8 @@ function usage(): never {
   --effort <e>          low|medium|high|xhigh|max
   --thinking            enable adaptive thinking; summaries printed to stderr
   --json                print {text, stop_reason, usage, tool_calls} as JSON
+  --events              emit JSONL to stdout as each block completes:
+                        thinking|text|tool_use|tool_result, then a final "done"
   --max-tokens <n>      default 16000
   --max-turns <n>       agentic loop cap, default 24`);
   process.exit(1);
@@ -49,6 +52,7 @@ function parseArgs(argv: string[]): Args {
     tools: [],
     thinking: false,
     json: false,
+    events: false,
     maxTokens: 16000,
     maxTurns: 24,
   };
@@ -68,6 +72,7 @@ function parseArgs(argv: string[]): Args {
       case "--effort": a.effort = next(); break;
       case "--thinking": a.thinking = true; break;
       case "--json": a.json = true; break;
+      case "--events": a.events = true; break;
       case "--max-tokens": a.maxTokens = parseInt(next(), 10); break;
       case "--max-turns": a.maxTurns = parseInt(next(), 10); break;
       case "-h": case "--help": usage();
@@ -149,8 +154,12 @@ async function main() {
   let response: Anthropic.Message | undefined;
   const totalUsage = { input_tokens: 0, output_tokens: 0 };
 
+  const emit = (ev: Record<string, unknown>) => console.log(JSON.stringify(ev));
+
   for (let turn = 0; turn < args.maxTurns; turn++) {
-    response = await client.messages.create({
+    // Stream so large --max-tokens values don't trip the SDK's 10-minute
+    // non-streaming guard; finalMessage() gives the same Message shape.
+    const stream = client.messages.stream({
       model,
       max_tokens: args.maxTokens,
       ...(args.system ? { system: args.system } : {}),
@@ -158,18 +167,26 @@ async function main() {
       ...(args.effort ? { output_config: { effort: args.effort } } : {}),
       ...(tools.size > 0 ? { tools: [...tools.values()].map((t) => t.definition) } : {}),
       messages,
-    } as Anthropic.MessageCreateParamsNonStreaming);
+    } as Anthropic.MessageStreamParams);
+
+    // Fires as each content block completes — before the message is done.
+    stream.on("contentBlock", (block) => {
+      if (block.type === "thinking" && block.thinking) {
+        if (args.events) emit({ event: "thinking", text: block.thinking });
+        else if (args.thinking) console.error(`[thinking] ${block.thinking}`);
+      } else if (block.type === "text") {
+        if (args.events) emit({ event: "text", text: block.text });
+        else console.error(`[text] ${block.text}`);
+      } else if (block.type === "tool_use") {
+        if (args.events) emit({ event: "tool_use", name: block.name, input: block.input });
+        else console.error(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
+      }
+    });
+
+    response = await stream.finalMessage();
 
     totalUsage.input_tokens += response.usage.input_tokens;
     totalUsage.output_tokens += response.usage.output_tokens;
-
-    if (args.thinking) {
-      for (const block of response.content) {
-        if (block.type === "thinking" && block.thinking) {
-          console.error(`[thinking] ${block.thinking}`);
-        }
-      }
-    }
 
     if (response.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: response.content });
@@ -188,7 +205,6 @@ async function main() {
         result = `Error: unknown tool "${block.name}"`;
         isError = true;
       } else {
-        console.error(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
         try {
           const out = await tool.run(block.input);
           result = typeof out === "string" ? out : JSON.stringify(out);
@@ -198,6 +214,12 @@ async function main() {
         }
       }
       toolCallLog.push({ name: block.name, input: block.input, result, is_error: isError });
+      if (args.events) {
+        emit({ event: "tool_result", name: block.name, result, is_error: isError });
+      } else {
+        const shown = result.length > 500 ? `${result.slice(0, 500)}…` : result;
+        console.error(`[tool result${isError ? " (error)" : ""}] ${shown}`);
+      }
       results.push({
         type: "tool_result",
         tool_use_id: block.id,
@@ -223,7 +245,15 @@ async function main() {
     .map((b) => b.text)
     .join("\n");
 
-  if (args.json) {
+  if (args.events) {
+    emit({
+      event: "done",
+      text,
+      model: response.model,
+      stop_reason: response.stop_reason,
+      usage: totalUsage,
+    });
+  } else if (args.json) {
     console.log(JSON.stringify({
       text,
       model: response.model,
