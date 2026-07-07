@@ -12,11 +12,28 @@ const MODEL_ALIASES: Record<string, string> = {
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
   fable: "claude-fable-5",
+  minimax: "MiniMax-M2.5",
+  m3: "MiniMax-M3",
+  "m2.7": "MiniMax-M2.7",
+  "m2.5": "MiniMax-M2.5",
+  "m2.1": "MiniMax-M2.1",
+};
+
+// MiniMax serves an Anthropic-compatible API, so both providers use the same
+// SDK — only baseURL/key differ. MiniMax ignores/rejects output_config, so
+// --effort is anthropic-only.
+const PROVIDERS: Record<string, { baseURL?: string; apiKeyEnv: string; defaultModel: string }> = {
+  anthropic: { apiKeyEnv: "ANTHROPIC_API_KEY", defaultModel: "opus" },
+  minimax: {
+    baseURL: "https://api.minimax.io/anthropic",
+    apiKeyEnv: "MINIMAX_API_KEY",
+    defaultModel: "minimax",
+  },
 };
 
 interface Args {
-  provider: string;
-  model: string;
+  provider?: string;
+  model?: string;
   tools: string[];
   system?: string;
   prompt?: string;
@@ -30,8 +47,9 @@ interface Args {
 
 function usage(): never {
   console.error(`usage: run-model [flags] [prompt]
-  --provider <name>     only "anthropic" supported (default: anthropic)
-  --model <m>           opus|sonnet|haiku|fable or full claude-* id (default: opus)
+  --provider <name>     anthropic|minimax (default: inferred from model, else anthropic)
+  --model <m>           opus|sonnet|haiku|fable or full claude-* id (default: opus);
+                        minimax|m3|m2.7|m2.5|m2.1 or full MiniMax-* id
   --tools <path>        tool .json file, or directory of them; repeatable
   --system <text>       system prompt
   --prompt <text>       prompt (alternative to positional arg or stdin)
@@ -47,8 +65,6 @@ function usage(): never {
 
 function parseArgs(argv: string[]): Args {
   const a: Args = {
-    provider: "anthropic",
-    model: "opus",
     tools: [],
     thinking: false,
     json: false,
@@ -134,18 +150,40 @@ async function loadTools(paths: string[]): Promise<Map<string, LoadedTool>> {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.provider !== "anthropic") {
-    console.error(`run-model: provider "${args.provider}" not supported (only: anthropic)`);
+  // Resolve provider/model: explicit --provider wins; otherwise infer minimax
+  // from a MiniMax-* model; each provider has its own default model.
+  let model = args.model ? MODEL_ALIASES[args.model] ?? args.model : undefined;
+  const provider = args.provider ?? (model?.startsWith("MiniMax") ? "minimax" : "anthropic");
+  const providerConf = PROVIDERS[provider];
+  if (!providerConf) {
+    console.error(`run-model: provider "${provider}" not supported (only: ${Object.keys(PROVIDERS).join(", ")})`);
     process.exit(1);
   }
+  model ??= MODEL_ALIASES[providerConf.defaultModel];
+
+  if (provider === "minimax" && args.effort) {
+    console.error(`run-model: minimax does not support --effort; ignoring`);
+    args.effort = undefined;
+  }
+
   if (!args.prompt && !process.stdin.isTTY) {
     args.prompt = fs.readFileSync(0, "utf8").trim();
   }
   if (!args.prompt) usage();
 
-  const model = MODEL_ALIASES[args.model] ?? args.model;
+  // Anthropic can also auth via an `ant auth login` profile, so a missing env
+  // var is only fatal for other providers.
+  const apiKey = process.env[providerConf.apiKeyEnv];
+  if (!apiKey && provider !== "anthropic") {
+    console.error(`run-model: ${providerConf.apiKeyEnv} not set (required for provider "${provider}")`);
+    process.exit(1);
+  }
+
   const tools = await loadTools(args.tools);
-  const client = new Anthropic();
+  const client = new Anthropic({
+    ...(providerConf.baseURL ? { baseURL: providerConf.baseURL } : {}),
+    ...(apiKey ? { apiKey } : {}),
+  });
 
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: args.prompt },
@@ -163,7 +201,11 @@ async function main() {
       model,
       max_tokens: args.maxTokens,
       ...(args.system ? { system: args.system } : {}),
-      ...(args.thinking ? { thinking: { type: "adaptive", display: "summarized" } } : {}),
+      // MiniMax accepts adaptive thinking but not the display field (M2.x
+      // models think unconditionally either way).
+      ...(args.thinking
+        ? { thinking: provider === "minimax" ? { type: "adaptive" } : { type: "adaptive", display: "summarized" } }
+        : {}),
       ...(args.effort ? { output_config: { effort: args.effort } } : {}),
       ...(tools.size > 0 ? { tools: [...tools.values()].map((t) => t.definition) } : {}),
       messages,
