@@ -53,8 +53,9 @@ function usage(): never {
   --tools <path>        tool .json file, or directory of them; repeatable
   --system <text>       system prompt
   --prompt <text>       prompt (alternative to positional arg or stdin)
-  --effort <e>          low|medium|high|xhigh|max
+  --effort <e>          low|medium|high|xhigh|max (anthropic only; not haiku)
   --thinking            enable adaptive thinking; summaries printed to stderr
+                        (not supported on haiku)
   --json                print {text, stop_reason, usage, tool_calls} as JSON
   --events              emit JSONL to stdout as each block completes:
                         thinking|text|tool_use|tool_result, then a final "done"
@@ -62,6 +63,8 @@ function usage(): never {
   --max-turns <n>       agentic loop cap, default 24`);
   process.exit(1);
 }
+
+const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 function parseArgs(argv: string[]): Args {
   const a: Args = {
@@ -98,6 +101,10 @@ function parseArgs(argv: string[]): Args {
     }
   }
   if (!a.prompt && positional.length > 0) a.prompt = positional.join(" ");
+  if (a.effort && !EFFORTS.has(a.effort)) {
+    console.error(`run-model: invalid --effort "${a.effort}" (valid: ${[...EFFORTS].join("|")})`);
+    process.exit(1);
+  }
   return a;
 }
 
@@ -164,6 +171,19 @@ async function main() {
   if (provider === "minimax" && args.effort) {
     console.error(`run-model: minimax does not support --effort; ignoring`);
     args.effort = undefined;
+  }
+
+  // Haiku 4.5 supports neither output_config.effort nor adaptive thinking —
+  // sending either is an API 400, so drop them like the minimax guard above.
+  if (model.startsWith("claude-haiku")) {
+    if (args.effort) {
+      console.error(`run-model: haiku does not support --effort; ignoring`);
+      args.effort = undefined;
+    }
+    if (args.thinking) {
+      console.error(`run-model: haiku does not support --thinking (adaptive); ignoring`);
+      args.thinking = false;
+    }
   }
 
   if (!args.prompt && !process.stdin.isTTY) {
@@ -279,6 +299,10 @@ async function main() {
   }
   if (response.stop_reason === "tool_use") {
     console.error(`run-model: hit --max-turns (${args.maxTurns}) with tool calls still pending`);
+    process.exit(3);
+  }
+  if (response.stop_reason === "pause_turn") {
+    console.error(`run-model: hit --max-turns (${args.maxTurns}) with the turn still paused`);
     process.exit(3);
   }
 

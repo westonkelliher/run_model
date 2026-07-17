@@ -17,8 +17,8 @@ echo "your prompt" | run-model [flags]        # prompt via stdin also works
 | `--tools <path>` | A tool `.json` file, or a directory of them. Repeatable. | none |
 | `--system <text>` | System prompt | none |
 | `--prompt <text>` | Prompt (alternative to positional/stdin) | — |
-| `--effort <e>` | `low`\|`medium`\|`high`\|`xhigh`\|`max` (not on haiku; ignored on minimax) | API default (`high`) |
-| `--thinking` | Enable adaptive thinking; summaries print to **stderr** (not on haiku) | off |
+| `--effort <e>` | `low`\|`medium`\|`high`\|`xhigh`\|`max` (dropped with a warning on haiku and minimax) | API default (`high`) |
+| `--thinking` | Enable adaptive thinking; summaries print to **stderr** (dropped with a warning on haiku) | off |
 | `--json` | Print `{text, model, stop_reason, usage, tool_calls}` JSON | plain text |
 | `--events` | JSONL to stdout as each block completes (see below) | off |
 | `--max-tokens <n>` | Per-response output cap | 16000 |
@@ -69,7 +69,7 @@ export default async function myTool(input: { arg: string }): Promise<string> {
 Needs `ANTHROPIC_API_KEY` in the environment (or an `ant auth login` profile —
 the SDK resolves either). MiniMax needs `MINIMAX_API_KEY`. Keys live at
 `~/.keys/.anthropic` and `~/.keys/.minimax2.5_tool_caller`; callers like
-grim_ide's `implement.sh` export them from there.
+grim_ide's `implement.py`/`frontend.py` load whichever one matches the model.
 
 ## Example
 
