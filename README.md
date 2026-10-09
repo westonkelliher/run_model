@@ -23,7 +23,7 @@ echo "your prompt" | run-model [flags]        # prompt via stdin also works
 | `--events` | JSONL to stdout as each block completes (see below) | off |
 | `--max-tokens <n>` | Per-response output cap | 16000 |
 | `--max-turns <n>` | Agentic loop cap | 24 |
-| `--provider <p>` | `anthropic` \| `minimax` (MiniMax's Anthropic-compatible API) | inferred from model, else `anthropic` |
+| `--provider <p>` | `anthropic` \| `minimax` (MiniMax's Anthropic-compatible API) \| `claude-code` (the Claude Code CLI on the logged-in claude.ai account: no API key; tools served to it over stdio MCP by `src/mcp_server.ts`; `--max-tokens`/`--thinking` are ignored) | inferred from model, else `anthropic` |
 
 ## Defining a tool
 
@@ -66,7 +66,8 @@ export default async function myTool(input: { arg: string }): Promise<string> {
 
 ## Auth
 
-Needs `ANTHROPIC_API_KEY` in the environment (or an `ant auth login` profile —
+`--provider claude-code` needs only a logged-in `claude` CLI (`claude login`), and strips
+`ANTHROPIC_API_KEY` from the child so the account is used. Otherwise: needs `ANTHROPIC_API_KEY` in the environment (or an `ant auth login` profile —
 the SDK resolves either). MiniMax needs `MINIMAX_API_KEY`. Keys live at
 `~/.keys/.anthropic` and `~/.keys/.minimax2.5_tool_caller`; callers like
 grim_ide's `implement.py`/`frontend.py` load whichever one matches the model.

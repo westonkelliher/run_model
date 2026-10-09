@@ -5,7 +5,10 @@
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import os from "node:os";
+import readline from "node:readline";
+import { spawn } from "node:child_process";
+import { loadTools, type LoadedTool } from "./tools.ts";
 
 const MODEL_ALIASES: Record<string, string> = {
   opus: "claude-opus-4-8",
@@ -22,8 +25,12 @@ const MODEL_ALIASES: Record<string, string> = {
 // MiniMax serves an Anthropic-compatible API, so both providers use the same
 // SDK — only baseURL/key differ. MiniMax ignores/rejects output_config, so
 // --effort is anthropic-only.
+// claude-code runs the loop through `claude -p` (the Claude Code CLI) on the
+// logged-in claude.ai account instead of an API key; the tools are served to it
+// over stdio MCP by src/mcp_server.ts. No key, no SDK call.
 const PROVIDERS: Record<string, { baseURL?: string; apiKeyEnv: string; defaultModel: string }> = {
   anthropic: { apiKeyEnv: "ANTHROPIC_API_KEY", defaultModel: "opus" },
+  "claude-code": { apiKeyEnv: "", defaultModel: "opus" },
   minimax: {
     baseURL: "https://api.minimax.io/anthropic",
     apiKeyEnv: "MINIMAX_API_KEY",
@@ -47,7 +54,8 @@ interface Args {
 
 function usage(): never {
   console.error(`usage: run-model [flags] [prompt]
-  --provider <name>     anthropic|minimax (default: inferred from model, else anthropic)
+  --provider <name>     anthropic|minimax|claude-code (default: inferred from model, else anthropic)
+                        claude-code = the Claude Code CLI on the logged-in account (no API key)
   --model <m>           opus|sonnet|haiku|fable or full claude-* id (default: opus);
                         minimax|m3|m2.7|m2.5|m2.1 or full MiniMax-* id
   --tools <path>        tool .json file, or directory of them; repeatable
@@ -108,50 +116,119 @@ function parseArgs(argv: string[]): Args {
   return a;
 }
 
-interface LoadedTool {
-  definition: Anthropic.Tool;
-  run: (input: unknown) => Promise<unknown>;
-}
+// ---- claude-code provider: `claude -p` + stdio MCP tool server ---- //
 
-async function loadTool(jsonPath: string): Promise<LoadedTool> {
-  const definition = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
-  for (const field of ["name", "description", "input_schema"]) {
-    if (!(field in definition)) {
-      throw new Error(`${jsonPath}: missing required field "${field}"`);
-    }
-  }
-  const tsPath = jsonPath.replace(/\.json$/, ".ts");
-  if (!fs.existsSync(tsPath)) {
-    throw new Error(`${jsonPath}: no sibling implementation ${tsPath}`);
-  }
-  const mod = await import(pathToFileURL(tsPath).href);
-  if (typeof mod.default !== "function") {
-    throw new Error(`${tsPath}: must default-export a function (input) => result`);
-  }
-  return { definition, run: mod.default };
-}
+const CC_SERVER = "grim"; // tools surface to the model as mcp__grim__<name>
 
-async function loadTools(paths: string[]): Promise<Map<string, LoadedTool>> {
-  const jsonFiles: string[] = [];
-  for (const p of paths) {
-    const resolved = path.resolve(p);
-    if (fs.statSync(resolved).isDirectory()) {
-      for (const f of fs.readdirSync(resolved)) {
-        if (f.endsWith(".json")) jsonFiles.push(path.join(resolved, f));
+async function runClaudeCode(args: Args, model: string, tools: Map<string, LoadedTool>): Promise<number> {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const tsx = path.join(here, "..", "node_modules", ".bin", "tsx");
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+  // no key: the CLI must use the account; no nesting guard: we may run inside a Claude Code session
+  for (const k of ["ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]) delete env[k];
+
+  const mcp = {
+    mcpServers: {
+      [CC_SERVER]: {
+        type: "stdio",
+        command: tsx,
+        args: [path.join(here, "mcp_server.ts"), ...args.tools.flatMap((t) => ["--tools", path.resolve(t)])],
+        env,
+      },
+    },
+  };
+  const toolNames = [...tools.keys()].map((n) => `mcp__${CC_SERVER}__${n}`);
+  const cli = [
+    "-p",
+    "--model", model,
+    "--output-format", "stream-json", "--verbose",
+    "--tools", "",                 // no built-in tools: the model sees only what --tools serves
+    "--setting-sources", "",       // no user/project settings, hooks or extra MCP servers
+    "--no-session-persistence",
+    "--max-turns", String(args.maxTurns),
+    "--permission-mode", "bypassPermissions",
+    ...(tools.size > 0 ? ["--strict-mcp-config", "--mcp-config", JSON.stringify(mcp), "--allowedTools", ...toolNames] : []),
+    ...(args.system ? ["--system-prompt", args.system] : []),
+    ...(args.effort ? ["--effort", args.effort] : []),
+  ];
+  // cwd outside $HOME so no CLAUDE.md is picked up
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "run-model-cc-"));
+  const child = spawn("claude", cli, { cwd, env, stdio: ["pipe", "pipe", "inherit"] });
+  child.stdin.end(args.prompt);
+
+  const emit = (ev: Record<string, unknown>) => console.log(JSON.stringify(ev));
+  const strip = (n: string) => n.startsWith(`mcp__${CC_SERVER}__`) ? n.slice(CC_SERVER.length + 7) : n;
+  const toolCallLog: { name: string; input: unknown; result: string; is_error: boolean }[] = [];
+  const pendingCalls = new Map<string, { name: string; input: unknown }>();
+  let result: any;
+  const totalUsage = { input_tokens: 0, output_tokens: 0 };
+
+  const rl = readline.createInterface({ input: child.stdout });
+  for await (const line of rl) {
+    let msg: any;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.type === "assistant") {
+      for (const block of msg.message?.content ?? []) {
+        if (block.type === "text" && block.text) {
+          if (args.events) emit({ event: "text", text: block.text });
+          else console.error(`[text] ${block.text}`);
+        } else if (block.type === "thinking" && block.thinking) {
+          if (args.events) emit({ event: "thinking", text: block.thinking });
+          else if (args.thinking) console.error(`[thinking] ${block.thinking}`);
+        } else if (block.type === "tool_use") {
+          const name = strip(block.name);
+          pendingCalls.set(block.id, { name, input: block.input });
+          if (args.events) emit({ event: "tool_use", name, input: block.input });
+          else console.error(`[tool] ${name} ${JSON.stringify(block.input)}`);
+        }
       }
-    } else {
-      jsonFiles.push(resolved);
+      const u = msg.message?.usage;
+      if (u) { totalUsage.input_tokens += u.input_tokens ?? 0; totalUsage.output_tokens += u.output_tokens ?? 0; }
+    } else if (msg.type === "user") {
+      for (const block of msg.message?.content ?? []) {
+        if (block.type !== "tool_result") continue;
+        const call = pendingCalls.get(block.tool_use_id) ?? { name: "?", input: null };
+        const text = typeof block.content === "string"
+          ? block.content
+          : (block.content ?? []).map((c: any) => c.text ?? "").join("\n");
+        const isError = !!block.is_error;
+        toolCallLog.push({ name: call.name, input: call.input, result: text, is_error: isError });
+        if (args.events) emit({ event: "tool_result", name: call.name, result: text, is_error: isError });
+        else {
+          const shown = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+          console.error(`[tool result${isError ? " (error)" : ""}] ${shown}`);
+        }
+      }
+    } else if (msg.type === "result") {
+      result = msg;
     }
   }
-  const tools = new Map<string, LoadedTool>();
-  for (const f of jsonFiles) {
-    const tool = await loadTool(f);
-    if (tools.has(tool.definition.name)) {
-      throw new Error(`duplicate tool name "${tool.definition.name}" from ${f}`);
-    }
-    tools.set(tool.definition.name, tool);
+  const code: number = await new Promise((res) => child.on("close", (c) => res(c ?? 1)));
+  fs.rmSync(cwd, { recursive: true, force: true });
+
+  if (!result) {
+    console.error(`run-model: claude exited (${code}) without a result`);
+    return code || 1;
   }
-  return tools;
+  const text: string = typeof result.result === "string" ? result.result : "";
+  if (result.subtype === "error_max_turns") {
+    console.error(`run-model: hit --max-turns (${args.maxTurns}) with the model still working`);
+    return 3;
+  }
+  if (result.is_error) {
+    console.error(`run-model: ${text || result.subtype}`);
+    return 1;
+  }
+  const stop_reason = result.stop_reason ?? "end_turn";
+  if (args.events) {
+    emit({ event: "done", text, model, stop_reason, usage: totalUsage });
+  } else if (args.json) {
+    console.log(JSON.stringify({ text, model, stop_reason, usage: totalUsage, tool_calls: toolCallLog }, null, 2));
+  } else {
+    console.log(text);
+  }
+  return 0;
 }
 
 async function main() {
@@ -161,6 +238,7 @@ async function main() {
   // from a MiniMax-* model; each provider has its own default model.
   let model = args.model ? MODEL_ALIASES[args.model] ?? args.model : undefined;
   const provider = args.provider ?? (model?.startsWith("MiniMax") ? "minimax" : "anthropic");
+  if (provider === "claude-code") model = args.model ?? "opus";
   const providerConf = PROVIDERS[provider];
   if (!providerConf) {
     console.error(`run-model: provider "${provider}" not supported (only: ${Object.keys(PROVIDERS).join(", ")})`);
@@ -193,13 +271,16 @@ async function main() {
 
   // Anthropic can also auth via an `ant auth login` profile, so a missing env
   // var is only fatal for other providers.
-  const apiKey = process.env[providerConf.apiKeyEnv];
-  if (!apiKey && provider !== "anthropic") {
+  const apiKey = providerConf.apiKeyEnv ? process.env[providerConf.apiKeyEnv] : undefined;
+  if (!apiKey && provider !== "anthropic" && provider !== "claude-code") {
     console.error(`run-model: ${providerConf.apiKeyEnv} not set (required for provider "${provider}")`);
     process.exit(1);
   }
 
   const tools = await loadTools(args.tools);
+  if (provider === "claude-code") {
+    process.exit(await runClaudeCode(args, model, tools));
+  }
   const client = new Anthropic({
     ...(providerConf.baseURL ? { baseURL: providerConf.baseURL } : {}),
     ...(apiKey ? { apiKey } : {}),
